@@ -604,6 +604,7 @@ void FBCopy::copyGeneratorValues(const std::string& gfrom, const std::string& gt
     st2->Prepare("SET GENERATOR "+gto+" TO "+std::string(tbuf1));
     st2->Execute();
     tr1->Commit();
+    tr2->Commit();
 }
 
 void FBCopy::compareGeneratorValues(const std::string& gfrom, const std::string& gto)
@@ -958,10 +959,19 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
     if (!st1->IsNull(6) && not_nulls)
         null_flag = " NOT NULL";
 
+    std::string default_source;
+    if (!st1->IsNull(7) && not_nulls) {
+    	st1->Get(7, default_source);
+    }
+    else
+ 	default_source = "";
+
     std::ostringstream retval;      // this will be returned
     if (datatype == 27 && scale < 0)
     {
-        retval << "Numeric(15," << -scale << ")" << null_flag;
+        retval << "Numeric(15," << -scale << ")";
+    	retval << " " << default_source << " "; 
+    	retval << null_flag;
         return retval.str();
     }
 
@@ -976,6 +986,8 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
                 retval << "Integer";
             else
                 retval << "Numeric(18,0)";
+
+	    retval << " " << default_source << " ";
             retval << null_flag;
             return retval.str();
         }
@@ -986,7 +998,10 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
                 retval << 18;
             else
                 retval << precision;
-            retval << "," << -scale << ")" << null_flag;
+            retval << "," << -scale << ")";
+
+	    retval << " " << default_source << " ";
+    	    retval << null_flag;
             return retval.str();
         }
     }
@@ -1014,6 +1029,8 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
         retval << "(" << length << ")";
     if (datatype == 261)    // blob
         retval << " sub_type " << subtype;
+    
+    retval << " " << default_source << " ";
     retval << null_flag;
     return retval.str();
 }
@@ -1562,7 +1579,7 @@ void FBCopy::compareTable(std::string table, IBPP::Statement& st1, IBPP::Stateme
         IBPP::Statement st3 = IBPP::StatementFactory(src, tr1);
         st3->Prepare(
             "select t.rdb$type, f.rdb$field_sub_type, f.rdb$field_length,"
-            "f.rdb$field_precision, f.rdb$field_scale, r.rdb$null_flag "
+            "f.rdb$field_precision, f.rdb$field_scale, r.rdb$null_flag, r.RDB$DEFAULT_SOURCE "
             "from rdb$fields f "
             "join rdb$relation_fields r on f.rdb$field_name=r.rdb$field_source "
             "join rdb$types t on f.rdb$field_type=t.rdb$type "

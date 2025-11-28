@@ -961,7 +961,7 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
 
     std::string default_source;
     if (!st1->IsNull(7) && not_nulls) {
-    	st1->Get(7, default_source);
+        st1->Get(7, default_source);
     }
     else
  	default_source = "";

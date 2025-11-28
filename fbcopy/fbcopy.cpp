@@ -964,7 +964,7 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
         st1->Get(7, default_source);
     }
     else
- 	default_source = "";
+        default_source = "";
 
     std::ostringstream retval;      // this will be returned
     if (datatype == 27 && scale < 0)

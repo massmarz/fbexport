@@ -102,6 +102,7 @@ int FBCopy::Run(Args *a)
     try
     {
         disableTriggers();
+        dropSelfReferencingForeignKey();
         trans1 = IBPP::TransactionFactory(src,  IBPP::amRead);
         trans2 = IBPP::TransactionFactory(dest, IBPP::amWrite);
         if (ar->SingleTransaction)
@@ -135,6 +136,7 @@ int FBCopy::Run(Args *a)
         retval = 4;
     }
     enableTriggers();
+    recreateSelfReferencingForeignKey();
     return retval;
 }
 
@@ -202,9 +204,93 @@ void FBCopy::enableTriggers()
 
     if (!ok)
     {
-        printf("\nTriggers could not get enabled! Please run the following statements manually:\n");
+        fprintf(stderr, "\nTriggers could not get enabled! Please run the following statements manually:\n");
         for (std::vector<std::string>::const_iterator it = triggers.begin(); it!=triggers.end(); ++it)
-            printf("ALTER TRIGGER %s ACTIVE;\n", (*it).c_str());
+            fprintf(stderr, "ALTER TRIGGER %s ACTIVE;\n", (*it).c_str());
+    }
+}
+
+void FBCopy::dropSelfReferencingForeignKey()
+{
+    if (ar->FireTriggers || ar->Operation != opCopy && ar->Operation != opSingle)
+        return;
+
+    fprintf(stderr, "Dropping self referencing foreign key...");
+    IBPP::Transaction tr1 = IBPP::TransactionFactory(dest);
+    tr1->Start();
+    IBPP::Statement st1 = IBPP::StatementFactory(dest, tr1);
+    st1->Prepare(
+        "SELECT "
+        "'ALTER TABLE ' || TRIM(detail_relation_constraints.rdb$relation_name) || ' DROP CONSTRAINT ' || trim(rdb$ref_constraints.RDB$CONSTRAINT_NAME), "
+        "'ALTER TABLE ' || TRIM(detail_relation_constraints.rdb$relation_name) || ' ADD CONSTRAINT ' || trim(rdb$ref_constraints.RDB$CONSTRAINT_NAME) "
+        "|| ' FOREIGN KEY(' || TRIM(detail_index_segments.rdb$field_name) "
+        "|| ') REFERENCES ' || TRIM(detail_relation_constraints.rdb$relation_name) || ' (' || TRIM(master_index_segments.rdb$field_name) || ')' "
+        "|| CASE WHEN TRIM(rdb$ref_constraints.RDB$DELETE_RULE) <> 'RESTRICT' THEN ' ON DELETE ' || TRIM(rdb$ref_constraints.RDB$DELETE_RULE) ELSE '' END "
+        "|| CASE WHEN TRIM(rdb$ref_constraints.RDB$UPDATE_RULE) <> 'RESTRICT' THEN ' ON UPDATE ' || TRIM(rdb$ref_constraints.RDB$UPDATE_RULE) ELSE '' END "
+        "FROM "
+        "rdb$relation_constraints detail_relation_constraints "
+        "JOIN rdb$index_segments detail_index_segments ON detail_relation_constraints.rdb$index_name = detail_index_segments.rdb$index_name "
+        "JOIN rdb$ref_constraints ON detail_relation_constraints.rdb$constraint_name = rdb$ref_constraints.rdb$constraint_name  "
+        "JOIN rdb$relation_constraints master_relation_constraints ON rdb$ref_constraints.rdb$const_name_uq = master_relation_constraints.rdb$constraint_name "
+        "JOIN rdb$index_segments master_index_segments ON master_relation_constraints.rdb$index_name = master_index_segments.rdb$index_name "
+        "WHERE "
+        "detail_relation_constraints.rdb$constraint_type = 'FOREIGN KEY' "
+        "AND detail_relation_constraints.rdb$relation_name = master_relation_constraints.rdb$relation_name"
+    );
+    st1->Execute();
+    while (st1->Fetch())
+    {
+        std::string s;
+        st1->Get(1, s);
+        selfReferencingFK1.push_back(s);
+        st1->Get(2, s);
+        selfReferencingFK2.push_back(s);
+    }
+    for (std::vector<std::string>::const_iterator it = selfReferencingFK1.begin(); it!=selfReferencingFK1.end(); ++it)
+    {
+        st1->Prepare((*it));
+        st1->Execute();
+    }
+    tr1->Commit();
+    fprintf(stderr, "done.\n");
+}
+
+void FBCopy::recreateSelfReferencingForeignKey()
+{
+    if (ar->FireTriggers || ar->Operation != opCopy && ar->Operation != opSingle || triggers.empty())
+        return;
+
+    fprintf(stderr, "Recreating self referencing foreign key...");
+    bool ok = false;
+    try
+    {
+        IBPP::Transaction tr1 = IBPP::TransactionFactory(dest);
+        tr1->Start();
+        IBPP::Statement st1 = IBPP::StatementFactory(dest, tr1);
+        for (std::vector<std::string>::const_iterator it = selfReferencingFK2.begin(); it!=selfReferencingFK2.end(); ++it)
+        {
+            st1->Prepare((*it));
+            st1->Execute();
+        }
+        tr1->Commit();
+        ok = true;
+        fprintf(stderr, "done.\n");
+    }
+    catch (IBPP::Exception &e)
+    {
+        fprintf(stderr, "\nERROR!\n");
+        fprintf(stderr, "%s", e.ErrorMessage());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "\nERROR!\nA non-IBPP C++ runtime exception occured !\n\n");
+    }
+
+    if (!ok)
+    {
+        fprintf(stderr, "\nSelf referencing foreign keys could not get recreated! Please run the following statements manually:\n");
+        for (std::vector<std::string>::const_iterator it = selfReferencingFK2.begin(); it!=selfReferencingFK2.end(); ++it)
+            fprintf(stderr, "%s;\n", (*it).c_str());
     }
 }
 
@@ -351,10 +437,10 @@ void FBCopy::setupFromStdin(CompareOrCopy action)
             std::string select = "SELECT " + fields + " FROM " + table;
             if (!where.empty())
                 select += where;
-            std::string insert = "INSERT INTO " + table + " (" + fields + ") VALUES (" + params(fields) + ")";
+            std::string insert = "UPDATE OR INSERT INTO " + table + " (" + fields + ") VALUES (" + params(fields) + ")";
             std::set<std::string> pkcols;
             std::string update = getUpdateStatement(table, fields, pkcols);
-            printf("Copying table: %s\n", table.c_str());
+            fprintf(stderr, "Copying table: %s\n", table.c_str());
             copy(select, insert, update, pkcols);
         }
         else    // compare records
@@ -507,7 +593,7 @@ string createHumanString(IBPP::Statement& st, int col, bool& numeric)
             value = str;
             break;
         case IBPP::sdFloat:
-            st->Get(col, &fval);            
+            st->Get(col, &fval);
             snprintf(str,30,"%19g",fval);
             value = str;
             numeric = true;
@@ -597,11 +683,12 @@ void FBCopy::copyGeneratorValues(const std::string& gfrom, const std::string& gt
     char tbuf1[64];
     sprintf(tbuf1, INT64FORMAT, x1);
 
-    printf("Generator %-32s -> %-32s = %s.\n", gfrom.c_str(), gto.c_str(), tbuf1);
+    fprintf(stderr, "Generator %-32s -> %-32s = %s.\n", gfrom.c_str(), gto.c_str(), tbuf1);
     IBPP::Transaction tr2 = IBPP::TransactionFactory(dest, IBPP::amWrite);
     tr2->Start();
     IBPP::Statement st2 = IBPP::StatementFactory(dest, tr2);
     st2->Prepare("SET GENERATOR "+gto+" TO "+std::string(tbuf1));
+
     st2->Execute();
     tr1->Commit();
     tr2->Commit();
@@ -833,9 +920,9 @@ int FBCopy::compareGenerators(IBPP::Transaction tr1, IBPP::Transaction tr2)
         st2->Set(1, s);
         st2->Execute();
         bool has = st2->Fetch();
-        if (ar->Operation == opSingle) 
+        if (ar->Operation == opSingle)
         {
-            if(has) 
+            if(has)
             {
                 copyGeneratorValues(s.c_str(), s.c_str());
             }
@@ -955,23 +1042,23 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
     else
         st1->Get(5, scale);
 
+
     std::string null_flag;
     if (!st1->IsNull(6) && not_nulls)
         null_flag = " NOT NULL";
 
-    std::string default_source;
+    std::string default_source = "";
     if (!st1->IsNull(7) && not_nulls) {
         st1->Get(7, default_source);
     }
-    else
-        default_source = "";
 
     std::ostringstream retval;      // this will be returned
     if (datatype == 27 && scale < 0)
     {
         retval << "Numeric(15," << -scale << ")";
-    	retval << " " << default_source << " "; 
-    	retval << null_flag;
+        if (!default_source.empty())
+            retval << " " << default_source << " ";
+        retval << null_flag;
         return retval.str();
     }
 
@@ -986,9 +1073,9 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
                 retval << "Integer";
             else
                 retval << "Numeric(18,0)";
-
-	    retval << " " << default_source << " ";
-            retval << null_flag;
+	    if (!default_source.empty())
+                retval << " " << default_source << " ";
+    	    retval << null_flag;
             return retval.str();
         }
         else
@@ -999,8 +1086,8 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
             else
                 retval << precision;
             retval << "," << -scale << ")";
-
-	    retval << " " << default_source << " ";
+	    if (!default_source.empty())
+                retval << " " << default_source << " ";
     	    retval << null_flag;
             return retval.str();
         }
@@ -1029,8 +1116,8 @@ std::string FBCopy::getDatatype(IBPP::Statement& st1, std::string table, std::st
         retval << "(" << length << ")";
     if (datatype == 261)    // blob
         retval << " sub_type " << subtype;
-    
-    retval << " " << default_source << " ";
+    if (!default_source.empty())
+        retval << " " << default_source << " ";
     retval << null_flag;
     return retval.str();
 }
@@ -1179,18 +1266,18 @@ bool FBCopy::copy(const std::string& select, const std::string& insert,
         if (++cnt % 2000 == 0)
             fprintf(stderr, "Checkpoint at %d rows.\n", cnt);
     }
-    printf("%d records copied", cnt - errors);
+    fprintf(stderr, "%d records copied", cnt - errors);
     if (partial > 0)
-        printf(" (%d only partially)", partial);
+        fprintf(stderr, " (%d only partially)", partial);
     if (!ar->SingleTransaction)
     {
         trans1->Commit();
         trans2->Commit();
-        printf(" and commited");
+        fprintf(stderr, " and commited");
     }
     if (errors)
-        printf(". Failed to copy %d records", errors);
-    printf(".\n");
+        fprintf(stderr, ". Failed to copy %d records", errors);
+    fprintf(stderr, ".\n");
     return true;
 }
 
@@ -1655,11 +1742,11 @@ void FBCopy::compareTable(std::string table, IBPP::Statement& st1, IBPP::Stateme
         else
         {
             std::string select = "SELECT " + join(fields,"\"",",") + " FROM " + table;
-            std::string insert = "INSERT INTO " + table + " ("
+            std::string insert = "UPDATE OR INSERT INTO " + table + " ("
                 + join(fields, "\"", ",")
                 + ") VALUES (" + params(join(fields,"",",")) + ")";
             //std::string update = getUpdateStatement(table, fields, pkcols)
-            printf("Copying table: %s\n", table.c_str());
+            fprintf(stderr, "Copying table: %s\n", table.c_str());
             std::set<std::string> dummy;
             copy(select, insert, "", dummy);
         }
